@@ -4,6 +4,7 @@
 // o(t) = σ(Wox x(t) + Woh h(t−1) + bo)
 // s(t) = g(t) ∗ i(t) + s(t−1) ∗ f(t)
 import Foundation
+import Accelerate
 
 class Math {
     static func sigmoid(_ x : Array<Double>) -> Array<Double> {
@@ -98,49 +99,55 @@ extension Array where Element == Double {
     }
 }
 
-func directAccessor(rows : Int) -> ((Int, Int) -> Int) {
+func directAccessor(rows: Int, cols : Int) -> ((Int, Int) -> Int) {
     //by row, 0-indexed
-    return { (r, c) in (c * rows + r) }
+    return { (r, c) in (r * cols + c) }
 }
 
 class Matrix<Element> {
     var data : Array<Element>
     let rows, cols : Int
     let accessor : (Int, Int) -> Int
-    let streamOK : Bool
+    let transposed : Bool
 
     convenience init(rows : Int, cols: Int, data : Array<Element>) {
-        self.init(rows: rows, cols: cols, data: data, accessor: directAccessor(rows: rows), streamOK: true)
+        self.init(rows: rows, cols: cols, data: data, accessor: directAccessor(rows: rows, cols: cols), transposed: false)
     }
 
-    init(rows : Int, cols: Int, data : Array<Element>, accessor: @escaping (Int, Int) -> Int, streamOK: Bool) {
+    init(rows : Int, cols: Int, data : Array<Element>, accessor: @escaping (Int, Int) -> Int, transposed: Bool) {
         self.data = data
         self.rows = rows
         self.cols = cols
         self.accessor = accessor
-        self.streamOK = streamOK
+        self.transposed = transposed
     }
 
     init(repeating v: Element, rows : Int, cols: Int) {
         self.data = Array(repeating: v, count: rows * cols)
         self.rows = rows
         self.cols = cols
-        self.accessor = directAccessor(rows: rows)
-        self.streamOK = true
+        self.accessor = directAccessor(rows: rows, cols: cols)
+        self.transposed = false
     }
 
     func transpose() -> Matrix<Element> {
-        return Matrix(rows: cols, cols: rows, data: data, accessor: { (i,j) in self.accessor(j,i) }, streamOK: !self.streamOK)
+        return Matrix(rows: cols, cols: rows, data: data, accessor: { (i,j) in self.accessor(j,i) }, transposed: !self.transposed)
     }
 
     func stream() -> Array<Element> {
-        assert(streamOK, "Transposed matrix should have the stream in reverse, which is not implemented yet")
+        assert(!transposed, "Transposed matrix should have the stream in reverse, which is not implemented yet")
         return data
     }
 
     subscript(i : Int, j : Int) -> Element {
-        assert(!(i<0 || i >= rows || j < 0 || j >= cols))
-        return data[accessor(i, j)]
+        get {
+            assert(!(i<0 || i >= rows || j < 0 || j >= cols))
+            return data[accessor(i, j)]
+        }
+        set {
+            assert(!(i<0 || i >= rows || j < 0 || j >= cols))
+            data[accessor(i, j)] = newValue
+        }
     }
 
 }
@@ -154,30 +161,36 @@ extension Matrix where Element == Double {
 
     static func § (_ a: Matrix<Double>, _ b : Array<Double>) -> Array <Double> {
         assert(a.cols == b.count)
-        var r = [Double](repeating: 0.0, count: a.rows)
-        for row in 0...a.rows-1 {
-            var sum = 0.0
-            for col in 0...a.cols-1 {
-                sum += b[col] * a[row, col]
-            }
-            r[row] = sum
+
+        var aData : [Double]
+        if(a.transposed) {
+            aData = [Double](repeating: 0.0, count: a.data.count)
+            vDSP_mtransD(a.data, 1, &aData, 1, vDSP_Length(a.cols), vDSP_Length(a.rows))
+        } else {
+            aData = a.data
         }
 
-        return r
+        var r2 = [Double](repeating: 0.0, count: a.rows)
+        vDSP_mmulD(aData, 1, b, 1, &r2, 1,
+                   vDSP_Length(a.rows),
+                   // 1 column in b matrix
+            vDSP_Length(1),
+            vDSP_Length(b.count) /* rows in b matrix */)
+        return r2
     }
 
     static func += (left: inout Matrix<Double>, right: Matrix<Double>) {
         assert(left.rows == right.rows && left.cols == right.cols)
-        assert(left.streamOK && right.streamOK)
+        assert(!left.transposed && !right.transposed)
         left.data += right.data
-//        left = Matrix(rows: left.rows, cols: left.cols, data: (left.stream() .+ right.stream()), accessor: directAccessor(rows: left.rows), streamOK: true)
+//        left = Matrix(rows: left.rows, cols: left.cols, data: (left.stream() .+ right.stream()), accessor: directAccessor(rows: left.rows, cols: left.cols), streamOK: true)
     }
 
     static func -= (left: inout Matrix<Double>, right: Matrix<Double>) {
         assert(left.rows == right.rows && left.cols == right.cols)
-        assert(left.streamOK && right.streamOK)
+        assert(!left.transposed && !right.transposed)
         left.data -= right.data
-//        left = Matrix(rows: left.rows, cols: left.cols, data: (left.stream() .- right.stream()), accessor: directAccessor(rows: left.rows), streamOK: true)
+//        left = Matrix(rows: left.rows, cols: left.cols, data: (left.stream() .- right.stream()), accessor: directAccessor(rows: left.rows, cols: left.cols), streamOK: true)
     }
 
     static func .* (left: Matrix<Double>, right: Double) -> Matrix<Double> {
@@ -185,14 +198,13 @@ extension Matrix where Element == Double {
     }
 
     static func outer(_ a: [Double], _ b: [Double]) -> Matrix<Double> {
-        var data = [Double](repeating: 0, count : a.count * b.count)
-        let accessor = directAccessor(rows: a.count)
-        for row in 0...a.count-1 {
-            for col in 0...b.count-1 {
-                data[accessor(row, col)] = a[row] * b[col]
-            }
-        }
-        return Matrix(rows: a.count, cols: b.count, data: data, accessor: accessor, streamOK: true)
+        let m = Matrix(repeating: 0.0, rows: a.count, cols: b.count)
+        vDSP_mmulD(a, 1, b, 1, &m.data, 1,
+                   vDSP_Length(a.count),
+                   // column in b matrix
+            vDSP_Length(b.count),
+            vDSP_Length(1) /* rows in b matrix */)
+        return m
     }
 
     static func zero_like(_ a : Matrix<Double>) -> Matrix<Double> {
